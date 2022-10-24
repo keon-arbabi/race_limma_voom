@@ -1,0 +1,175 @@
+---
+title: "race_limma_voom"
+output: html_document
+date: "2022-10-24"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load libraries
+```{r setup, include=FALSE}
+suppressPackageStartupMessages({
+
+  library(tidyverse)
+  library(data.table)
+  library(compositions)
+  library(kableExtra)
+  library(plyr)
+  library(cowplot)
+  library(gridExtra)
+  library(ggpubr)
+  library(limma)
+  library(edgeR)
+  library(variancePartition)
+}) 
+
+#source("./common_functions/common_functions.R")
+colorArray = colors()[grep("grey|gray", colors(), invert=TRUE)]
+
+```
+
+# Load data
+```{r}
+# load in data
+METADATA = readRDS(file = "./cmc_data/METADATA.rds") 
+geneCountsMerged = readRDS(file = "./cmc_data/geneCountsMerged.rds") 
+# check
+all(rownames(METADATA) == colnames(geneCountsMerged)) 
+
+```
+
+# Normalize     
+```{r}
+# filter genes
+isexpr.lst = dlply(METADATA, .(Cohort), .fun = function(mtd){
+	rowSums(cpm(geneCountsMerged[,mtd$SampleID])>.5) >= .3*ncol(geneCountsMerged[,mtd$SampleID])
+	})
+isexpr = do.call(rbind, isexpr.lst)
+# keep gene expressed in both cohorts 
+isexpr = colSums(isexpr) == 2 
+table(isexpr)
+   
+# normalize each cohort separately
+dge.lst = lapply(levels(METADATA$Cohort), function(Cohort){
+  # normalize counts
+  dge = DGEList(geneCountsMerged[isexpr,METADATA$Cohort==Cohort])
+  calcNormFactors(dge, "none") # TMM
+})
+names(dge.lst) = levels(METADATA$Cohort)
+
+```
+
+### Differential expression testing 
+```{r}
+# formulas 
+# add interaction of institution for MSSM-Penn-Pitt
+form.lst = list(
+  `MSSM-Penn-Pitt` = ~ 0 + Ethnicity + Dx + Ethnicity*Dx + Reported_Gender + RIN + scale(IntronicRate) + scale(IntragenicRate) + scale(IntergenicRate) + scale(rRNARate) + Institution*(ageOfDeath + cellFrac_ilr_1 + cellFrac_ilr_2 + cellFrac_ilr_3),
+  
+  `NIMH-HBCC` = ~ 0 + Ethnicity + Dx + Ethnicity*Dx + Reported_Gender + RIN + scale(IntronicRate) + scale(IntragenicRate) + scale(IntergenicRate) + scale(rRNARate) +  ageOfDeath + cellFrac_ilr_1 + cellFrac_ilr_2 + cellFrac_ilr_3
+  )
+# dream analysis 
+fit.lst = lapply(dge.lst, function(dge){
+
+  i = match(colnames(dge), rownames(METADATA))
+  info = METADATA[i,]
+  form_use = form.lst[[info$Cohort[1]]]
+  
+  L = makeContrastsDream(form_use, info, 
+                         contrasts = c("EthnicityAfrican-American - EthnicityCaucasian", "DxSCZ - DxControl", "DxSCZ - DxBP")) # EDIT
+  plotContrasts(L)
+
+  vobj_dream = voomWithDreamWeights(dge, form_use, info, plot = F)
+  fit = dream(vobj_dream, form_use, info, L)
+  fit = eBayes(fit)
+
+  })
+names(fit.lst) = names(dge.lst)
+
+```
+
+### Differentially expressed genelists 
+```{r}
+
+# Get background genes 
+backgroundGenes = data.frame(gene_id = rownames(geneCountsMerged)) %>%
+  dplyr::mutate(id = gene_id) %>%
+  tidyr::separate(id, c('ensembl_gene_id','position'), sep = '\\.')
+
+# Define biomart object
+mart = biomaRt::useMart(biomart = "ENSEMBL_MART_ENSEMBL",
+                        host = "uswest.ensembl.org", # Ensembl Release 99 (January 2020)
+                        dataset = "hsapiens_gene_ensembl")
+# Query biomart
+Ensemble2HGNC = biomaRt::getBM(attributes = c("ensembl_gene_id", "hgnc_symbol", "percentage_gene_gc_content", "gene_biotype", "chromosome_name"),
+                               filters = "ensembl_gene_id", 
+                               values = backgroundGenes$ensembl_gene_id,
+                               mart = mart)
+# get DE genes
+DE = lapply(fit.lst, function(FIT){
+  topTable(FIT, coef = c("DxBP - DxControl", "DxSCZ - DxControl", "DxSCZ - DxBP"), number = Inf) %>%
+    rownames_to_column(var = 'gene_id') %>% 
+    left_join(backgroundGenes) %>% 
+    left_join(Ensemble2HGNC) 
+})
+de_genes = do.call(rbind, DE) %>% filter(adj.P.Val < 0.05) %>% pull(gene_id) %>% unique()
+
+```
+
+### Variance explained by each term
+```{r}
+
+# combine normalized counts 
+dge.comb = cbind(dge.lst$`NIMH-HBCC`$counts,
+                 dge.lst$`MSSM-Penn-Pitt`$counts)
+
+form = ~ Dx + Reported_Gender + RIN +scale(IntronicRate) + scale(IntragenicRate) + scale(IntergenicRate) + scale(rRNARate) +
+  Institution*(ageOfDeath + cellFrac_ilr_1 + cellFrac_ilr_2 + cellFrac_ilr_3)
+
+vobj_dream = voomWithDreamWeights(dge.comb, form, METADATA, plot = F)
+vp = fitExtractVarPartModel(vobj_dream, form, METADATA)
+
+```
+
+### Residualize 
+```{r}
+
+# within cohorts 
+form.lst = list(
+  `MSSM-Penn-Pitt` = ~ Reported_Gender + RIN +scale(IntronicRate) + scale(IntragenicRate) + scale(IntergenicRate) + scale(rRNARate) + 
+   Institution*(ageOfDeath + cellFrac_ilr_1 + cellFrac_ilr_2 + cellFrac_ilr_3),
+  
+  `NIMH-HBCC` = ~ Reported_Gender + RIN + scale(IntronicRate) + scale(IntragenicRate) + scale(IntergenicRate) + scale(rRNARate) + 
+   ageOfDeath + cellFrac_ilr_1 + cellFrac_ilr_2 + cellFrac_ilr_3
+  )
+
+residuals.lst = lapply(dge.lst, function(dge){
+  
+  i = match(colnames(dge), rownames(METADATA))
+  info = METADATA[i,]
+  form_use = form.lst[[info$Cohort[1]]]
+  
+  vobj_dream = voomWithDreamWeights(dge, form_use, info, plot = F)
+  fit = dream(vobj_dream, form_use, info, computeResiduals = TRUE)
+  
+  residuals(fit, dge)
+})
+
+RESIDUAL.GENE_EXPRESSION = t(do.call(cbind, residuals.lst))
+RESIDUAL.GENE_EXPRESSION = RESIDUAL.GENE_EXPRESSION[match(METADATA$SampleID, rownames(RESIDUAL.GENE_EXPRESSION)),]
+
+# combined cohorts 
+form = ~ Reported_Gender + RIN +scale(IntronicRate) + scale(IntragenicRate) + scale(IntergenicRate) + scale(rRNARate) +
+  Institution*(ageOfDeath + cellFrac_ilr_1 + cellFrac_ilr_2 + cellFrac_ilr_3)
+
+vobj_dream = voomWithDreamWeights(dge.comb, form, METADATA, plot = F)
+fit = dream(vobj_dream, form, METADATA, computeResiduals = TRUE)
+
+RESIDUAL.GENE_EXPRESSION = residuals(fit)
+
+```
+
