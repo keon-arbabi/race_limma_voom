@@ -34,9 +34,21 @@ colorArray = colors()[grep("grey|gray", colors(), invert=TRUE)]
 
 # Load data
 ```{r}
-# load in data
-METADATA = readRDS(file = "./cmc_data/METADATA.rds") 
-geneCountsMerged = readRDS(file = "./cmc_data/geneCountsMerged.rds") 
+# load metadata 
+METADATA = readRDS(file = "./cmc_data/METADATA.rds") %>%
+  mutate(Dx = as.character(Dx)) %>%
+  filter(Ethnicity %in% c("Caucasian","African-American")) %>%
+  filter(Dx %in% c("Control","SCZ")) %>%
+  # recode
+  mutate(Ethnicity = case_when(Ethnicity == "African-American" ~ "AA", Ethnicity == "Caucasian" ~ "C")) %>%
+  # new variable for interaction of race and disorder
+  mutate(Group = interaction(Ethnicity, Dx, sep = ""))
+
+table(METADATA$Group)
+
+# load counts 
+geneCountsMerged = readRDS(file = "./cmc_data/geneCountsMerged.rds") %>%
+  dplyr::select(row.names(METADATA))
 # check
 all(rownames(METADATA) == colnames(geneCountsMerged)) 
 
@@ -63,14 +75,16 @@ names(dge.lst) = levels(METADATA$Cohort)
 
 ```
 
-### Differential expression testing 
+# Differential expression testing 
 ```{r}
 # formulas 
 # add interaction of institution for MSSM-Penn-Pitt
 form.lst = list(
-  `MSSM-Penn-Pitt` = ~ 0 + Ethnicity + Dx + Ethnicity*Dx + Reported_Gender + RIN + scale(IntronicRate) + scale(IntragenicRate) + scale(IntergenicRate) + scale(rRNARate) + Institution*(ageOfDeath + cellFrac_ilr_1 + cellFrac_ilr_2 + cellFrac_ilr_3),
+  `MSSM-Penn-Pitt` = ~ 0 + Group + Reported_Gender + RIN + scale(IntronicRate) + scale(IntragenicRate) + 
+    scale(IntergenicRate) + scale(rRNARate) + Institution*(ageOfDeath + cellFrac_ilr_1 + cellFrac_ilr_2 + cellFrac_ilr_3),
   
-  `NIMH-HBCC` = ~ 0 + Ethnicity + Dx + Ethnicity*Dx + Reported_Gender + RIN + scale(IntronicRate) + scale(IntragenicRate) + scale(IntergenicRate) + scale(rRNARate) +  ageOfDeath + cellFrac_ilr_1 + cellFrac_ilr_2 + cellFrac_ilr_3
+  `NIMH-HBCC` = ~ 0 + Group + Reported_Gender + RIN + scale(IntronicRate) + scale(IntragenicRate) + 
+    scale(IntergenicRate) + scale(rRNARate) +  ageOfDeath + cellFrac_ilr_1 + cellFrac_ilr_2 + cellFrac_ilr_3
   )
 # dream analysis 
 fit.lst = lapply(dge.lst, function(dge){
@@ -80,7 +94,9 @@ fit.lst = lapply(dge.lst, function(dge){
   form_use = form.lst[[info$Cohort[1]]]
   
   L = makeContrastsDream(form_use, info, 
-                         contrasts = c("EthnicityAfrican-American - EthnicityCaucasian", "DxSCZ - DxControl", "DxSCZ - DxBP")) # EDIT
+                         contrasts = c(AA_C_controls = "GroupAAControl - GroupCControl", # black vs white controls only
+                                       AA_C_scz = "GroupAASCZ - GroupCSCZ", # black vs white scz only 
+                                       AA_scz = "GroupAASCZ - GroupAAControl")) # black scz vs black controls 
   plotContrasts(L)
 
   vobj_dream = voomWithDreamWeights(dge, form_use, info, plot = F)
@@ -92,9 +108,8 @@ names(fit.lst) = names(dge.lst)
 
 ```
 
-### Differentially expressed genelists 
+# Differentially expressed genelists 
 ```{r}
-
 # Get background genes 
 backgroundGenes = data.frame(gene_id = rownames(geneCountsMerged)) %>%
   dplyr::mutate(id = gene_id) %>%
@@ -111,7 +126,7 @@ Ensemble2HGNC = biomaRt::getBM(attributes = c("ensembl_gene_id", "hgnc_symbol", 
                                mart = mart)
 # get DE genes
 DE = lapply(fit.lst, function(FIT){
-  topTable(FIT, coef = c("DxBP - DxControl", "DxSCZ - DxControl", "DxSCZ - DxBP"), number = Inf) %>%
+  topTable(FIT, coef = c("AA_C_controls", "AA_C_scz", "AA_scz"), number = Inf) %>%
     rownames_to_column(var = 'gene_id') %>% 
     left_join(backgroundGenes) %>% 
     left_join(Ensemble2HGNC) 
@@ -120,14 +135,13 @@ de_genes = do.call(rbind, DE) %>% filter(adj.P.Val < 0.05) %>% pull(gene_id) %>%
 
 ```
 
-### Variance explained by each term
+# Variance explained by each term
 ```{r}
-
 # combine normalized counts 
 dge.comb = cbind(dge.lst$`NIMH-HBCC`$counts,
                  dge.lst$`MSSM-Penn-Pitt`$counts)
 
-form = ~ Dx + Reported_Gender + RIN +scale(IntronicRate) + scale(IntragenicRate) + scale(IntergenicRate) + scale(rRNARate) +
+form = ~ Group + Reported_Gender + RIN +scale(IntronicRate) + scale(IntragenicRate) + scale(IntergenicRate) + scale(rRNARate) +
   Institution*(ageOfDeath + cellFrac_ilr_1 + cellFrac_ilr_2 + cellFrac_ilr_3)
 
 vobj_dream = voomWithDreamWeights(dge.comb, form, METADATA, plot = F)
@@ -135,9 +149,8 @@ vp = fitExtractVarPartModel(vobj_dream, form, METADATA)
 
 ```
 
-### Residualize 
+# Residualize 
 ```{r}
-
 # within cohorts 
 form.lst = list(
   `MSSM-Penn-Pitt` = ~ Reported_Gender + RIN +scale(IntronicRate) + scale(IntragenicRate) + scale(IntergenicRate) + scale(rRNARate) + 
